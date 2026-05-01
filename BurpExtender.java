@@ -33,6 +33,7 @@ package burp;
 import java.io.PrintWriter;
 import java.io.UnsupportedEncodingException;
 import java.net.MalformedURLException;
+import java.net.URI;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -94,8 +95,10 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
     private Set<String> alreadyTestedPassiveDCR = java.util.concurrent.ConcurrentHashMap.newKeySet();  // 被动拦截去重
     private Set<String> alreadyTestedActiveDCR = java.util.concurrent.ConcurrentHashMap.newKeySet();   // 主动探测去重
 
+    private static final String F7_STRONG_REDIRECT_PAYLOAD = "https://attacker.com";
     private static final List<String> INJ_REDIR = new ArrayList<>();
     static {
+        INJ_REDIR.add(F7_STRONG_REDIRECT_PAYLOAD);
         //INJ_REDIR.add("/../../../../../notexist");
         INJ_REDIR.add("%2f%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fnotexist");
         INJ_REDIR.add("/..;/..;/..;/../testOauth");
@@ -3608,17 +3611,149 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
         return issues;
     }
 
+    private static final int MAX_F7_REDIRECT_FOLLOWS = 10;
 
+    private class RedirectFollowResult {
+        public List<IHttpRequestResponse> messages = new ArrayList<>();
+        public IHttpRequestResponse finalResponse;
+        public boolean completed;
+        public String terminalReason = "";
+    }
 
+    private String buildNormalizedRedirectPath(URL nextUrl) throws Exception {
+        String normalizedExternal = nextUrl.toExternalForm().replace(" ", "%20");
+        URI normalizedUri = new URI(normalizedExternal);
 
+        String path = normalizedUri.getRawPath();
+        if (path == null || path.length() == 0) {
+            path = "/";
+        }
 
+        String rawQuery = normalizedUri.getRawQuery();
+        if (rawQuery != null && rawQuery.length() > 0) {
+            path += "?" + rawQuery;
+        }
+        return path;
+    }
+
+    private RedirectFollowResult followRedirectChain(IHttpRequestResponse firstResponse) {
+        RedirectFollowResult result = new RedirectFollowResult();
+        if (firstResponse == null) {
+            result.completed = false;
+            result.terminalReason = "initial request failed";
+            return result;
+        }
+
+        IHttpRequestResponse current = firstResponse;
+        result.messages.add(current);
+
+        for (int i = 0; i < MAX_F7_REDIRECT_FOLLOWS; i++) {
+            if (current.getResponse() == null) {
+                result.completed = false;
+                result.terminalReason = "response is empty";
+                result.finalResponse = current;
+                return result;
+            }
+
+            IResponseInfo currentRespInfo = helpers.analyzeResponse(current.getResponse());
+            short statusCode = currentRespInfo.getStatusCode();
+            if (statusCode < 300 || statusCode >= 400) {
+                result.completed = true;
+                result.finalResponse = current;
+                result.terminalReason = "terminal status " + statusCode;
+                return result;
+            }
+
+            String location = getHttpHeaderValueFromList(currentRespInfo.getHeaders(), "Location");
+            if (location == null || location.trim().length() == 0) {
+                result.completed = false;
+                result.finalResponse = current;
+                result.terminalReason = "3xx response without Location";
+                return result;
+            }
+
+            try {
+                URL currentUrl = helpers.analyzeRequest(current).getUrl();
+                URL nextUrl = new URL(currentUrl, location.trim());
+                if (!"http".equalsIgnoreCase(nextUrl.getProtocol()) && !"https".equalsIgnoreCase(nextUrl.getProtocol())) {
+                    result.completed = false;
+                    result.finalResponse = current;
+                    result.terminalReason = "unsupported redirect protocol: " + nextUrl.getProtocol();
+                    return result;
+                }
+                boolean useHttps = "https".equalsIgnoreCase(nextUrl.getProtocol());
+                int port = nextUrl.getPort();
+                if (port == -1) {
+                    port = useHttps ? 443 : 80;
+                }
+
+                String path = buildNormalizedRedirectPath(nextUrl);
+                String hostHeader = nextUrl.getHost();
+                if (nextUrl.getPort() != -1 && nextUrl.getPort() != (useHttps ? 443 : 80)) {
+                    hostHeader += ":" + nextUrl.getPort();
+                }
+
+                List<String> nextHeaders = new ArrayList<>();
+                nextHeaders.add("GET " + path + " HTTP/1.1");
+                nextHeaders.add("Host: " + hostHeader);
+                nextHeaders.add("User-Agent: Mozilla/5.0");
+                nextHeaders.add("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                nextHeaders.add("Connection: close");
+                byte[] nextRequest = helpers.buildHttpMessage(nextHeaders, new byte[0]);
+
+                IHttpService nextService = helpers.buildHttpService(nextUrl.getHost(), port, useHttps);
+                current = callbacks.makeHttpRequest(nextService, nextRequest);
+                result.messages.add(current);
+            } catch (Exception e) {
+                result.completed = false;
+                result.finalResponse = current;
+                result.terminalReason = "redirect follow failed: " + e.toString();
+                return result;
+            }
+        }
+
+        result.completed = false;
+        result.finalResponse = current;
+        result.terminalReason = "redirect chain exceeded " + MAX_F7_REDIRECT_FOLLOWS + " hops";
+        return result;
+    }
+
+    private String describeRedirectFollowResult(RedirectFollowResult result) {
+        StringBuilder desc = new StringBuilder();
+        desc.append("<b>Redirect follow result:</b> ").append(result.terminalReason).append("<br>");
+        desc.append("<b>Redirect hops followed:</b> ").append(Math.max(0, result.messages.size() - 1)).append("<br><br>");
+        return desc.toString();
+    }
+
+    private String getF7BlockReason(short statusCode, String lowerResponseStr) {
+        if (statusCode != 200) {
+            return "terminal status is not 200: " + statusCode;
+        }
+        if (lowerResponseStr == null) {
+            return null;
+        }
+        String body = lowerResponseStr;
+        if (body.contains("invalid redirect_uri") ||
+                body.contains("redirect_uri_mismatch") ||
+                body.contains("invalid redirect uri") ||
+                body.contains("unauthorized_client") ||
+                body.contains("invalid_request") ||
+                body.contains("bad request")) {
+            return "terminal response contains redirect validation marker";
+        }
+        return null;
+    }
 
     public List<IScanIssue> redirectScan(IHttpRequestResponse baseRequestResponse, IScannerInsertionPoint insertionPoint) {
     // Scan for open redirect issues on 'redirect_uri' parameter using Implicit Trust Heuristic (Absence of Error)
         List<IScanIssue> issues = new ArrayList<>();
     // 【新增】：进行拓扑层级鉴定
         String layer = identifyLayer(baseRequestResponse);
+        if (!"L1".equals(layer)) {
+            return issues;
+        }
         Boolean hostheaderCheck = false;
+        String hostHeaderPayload = null;
         IHttpRequestResponse checkRequestResponse = null;
         int[] payloadOffset = new int[2];
         String checkRequestStr = "";
@@ -3638,7 +3773,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
     // Checking only OAUTHv2 and OpenID authorization-code requests
         if (clientIdParameter != null && resptypeParameter != null) {
             if (insertionPoint.getInsertionPointName().equals("response_type")) { // Forcing to perform only a tentative (unique insertion point)
-                stdout.println("[+] Active Scan: Checking for Unvalidated Redirect on Authorization Code Flow");
+                stdout.println("[+] Active Scan: Checking for Layer 1 Unvalidated Redirect URI");
     // Iterating for each redirect_uri payload
                 for (String payload_redir : INJ_REDIR) {
                     String originalRedirUri = "";
@@ -3648,7 +3783,9 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                     } else {
                         originalRedirUri = proto + "://" + host;
                     }
+                    boolean isWeakF7Payload = !F7_STRONG_REDIRECT_PAYLOAD.equals(payload_redir);
                     hostheaderCheck = false;
+                    hostHeaderPayload = null;
 
     // Building some specific payloads
                     if (payload_redir.contains("../") || payload_redir.contains("..;/")) {
@@ -3664,8 +3801,8 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                         continue;
                     } else if (payload_redir.equals("HOST_HEADER")) {
                         hostheaderCheck = true;
-                        String newHostname = "burpcollaborator.net";
-                        payload_redir = newHostname + "/" + host;
+                        hostHeaderPayload = "burpcollaborator.net";
+                        payload_redir = hostHeaderPayload;
                     } else if (payload_redir.startsWith(".") || payload_redir.startsWith("@")) {
                         payload_redir = originalRedirUri + payload_redir;
                     }
@@ -3674,7 +3811,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                         List<String> reqHeaders = reqInfo.getHeaders();
                         List<String> checkReqHeaders = new ArrayList<>(reqHeaders);
                         Boolean isHost = false;
-                        String newHeader = "Host: " + payload_redir;
+                        String newHeader = "Host: " + hostHeaderPayload;
                         for (int i = 0; i < checkReqHeaders.size(); i++) {
                             if (checkReqHeaders.get(i).startsWith("Host: ")) {
                                 isHost = true;
@@ -3688,46 +3825,48 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                         byte[] checkRequest = helpers.buildHttpMessage(checkReqHeaders, reqBodyStr.getBytes());
                         checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
                         checkRequestStr = helpers.bytesToString(checkRequest);
+                    } else if (redirectUriParameter != null && redirectUriParameter.getType() == IParameter.PARAM_BODY) {
+                        IParameter newParam = helpers.buildParameter("redirect_uri", payload_redir, IParameter.PARAM_BODY);
+                        byte[] checkRequest = helpers.updateParameter(rawrequest, newParam);
+                        checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
+                        checkRequestStr = helpers.bytesToString(checkRequest);
+                    } else if (redirectUriParameter != null && redirectUriParameter.getType() == IParameter.PARAM_URL) {
+                        IParameter newParam = helpers.buildParameter("redirect_uri", payload_redir, IParameter.PARAM_URL);
+                        byte[] checkRequest = helpers.updateParameter(rawrequest, newParam);
+                        checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
+                        checkRequestStr = helpers.bytesToString(checkRequest);
                     } else {
-                        if (redirectUriParameter != null && redirectUriParameter.getType() == IParameter.PARAM_BODY) {
+    // For some custom OAUTH/OpenID request without 'redirect_uri' parameter
+                        if (reqInfo.getMethod().equals("POST")) {
                             IParameter newParam = helpers.buildParameter("redirect_uri", payload_redir, IParameter.PARAM_BODY);
-                            byte[] checkRequest = helpers.updateParameter(rawrequest, newParam);
-                            checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
-                            checkRequestStr = helpers.bytesToString(checkRequest);
-                        } else if (redirectUriParameter != null && redirectUriParameter.getType() == IParameter.PARAM_URL) {
-                            IParameter newParam = helpers.buildParameter("redirect_uri", payload_redir, IParameter.PARAM_URL);
-                            byte[] checkRequest = helpers.updateParameter(rawrequest, newParam);
+                            byte[] checkRequest = helpers.addParameter(rawrequest, newParam);
                             checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
                             checkRequestStr = helpers.bytesToString(checkRequest);
                         } else {
-    // For some custom OAUTH/OpenID request without 'redirect_uri' parameter
-                            if (reqInfo.getMethod().equals("POST")) {
-                                IParameter newParam = helpers.buildParameter("redirect_uri", payload_redir, IParameter.PARAM_BODY);
-                                byte[] checkRequest = helpers.addParameter(rawrequest, newParam);
-                                checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
-                                checkRequestStr = helpers.bytesToString(checkRequest);
-                            } else {
-                                IParameter newParam = helpers.buildParameter("redirect_uri", payload_redir, IParameter.PARAM_URL);
-                                byte[] checkRequest = helpers.addParameter(rawrequest, newParam);
-                                checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
-                                checkRequestStr = helpers.bytesToString(checkRequest);
-                            }
+                            IParameter newParam = helpers.buildParameter("redirect_uri", payload_redir, IParameter.PARAM_URL);
+                            byte[] checkRequest = helpers.addParameter(rawrequest, newParam);
+                            checkRequestResponse = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
+                            checkRequestStr = helpers.bytesToString(checkRequest);
                         }
                     }
 
-                    if (checkRequestResponse != null && checkRequestResponse.getResponse() != null) {
-                        byte[] checkResponse = checkRequestResponse.getResponse();
+                    RedirectFollowResult redirectResult = followRedirectChain(checkRequestResponse);
+                    if (!redirectResult.completed) {
+                        stdout.println("[F7 DEBUG] Payload [" + payload_redir + "] skipped: " + redirectResult.terminalReason
+                                + ", hops=" + Math.max(0, redirectResult.messages.size() - 1));
+                    }
+                    if (redirectResult.completed && redirectResult.finalResponse != null && redirectResult.finalResponse.getResponse() != null) {
+                        byte[] checkResponse = redirectResult.finalResponse.getResponse();
                         short statusCode = helpers.analyzeResponse(checkResponse).getStatusCode();
                         String lowerResponseStr = helpers.bytesToString(checkResponse).toLowerCase();
 
 
                         // 1. 定义防御机制的“拦截特征” (4xx 状态码或响应体包含明显错误词汇)
-                        boolean isBlocked = (statusCode >= 400 && statusCode < 500) ||
-                                lowerResponseStr.contains("error") ||
-                                lowerResponseStr.contains("invalid") ||
-                                lowerResponseStr.contains("mismatch") ||
-                                lowerResponseStr.contains("unauthorized") ||
-                                lowerResponseStr.contains("bad request");
+                        String blockReason = getF7BlockReason(statusCode, lowerResponseStr);
+                        boolean isBlocked = blockReason != null;
+                        stdout.println("[F7 DEBUG] Payload [" + payload_redir + "] -> " + redirectResult.terminalReason
+                                + ", hops=" + Math.max(0, redirectResult.messages.size() - 1)
+                                + ", verdict=" + (isBlocked ? "blocked (" + blockReason + ")" : "accepted"));
 
                         // 2. 如果没有被拦截，我们就认为它存在未校验风险！
                         if (!isBlocked) {
@@ -3740,24 +3879,33 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                             }
 
                         // 【新增】：基于层级动态生成报告标题和描述
-                            boolean isL1 = "L1".equals(layer);
-                            String issueTitle = isL1 ?
-                                    "[Flaw 7.1] Layer 1 Unvalidated Redirect URI" :
-                                    "[Flaw 7.2] Layer 2 Unvalidated Redirect URI";
-                            String issueDesc = isL1 ?
-                                    "发现<b>第一层网关 (MCP Server)</b> 授权端点可能缺乏重定向校验。<br><br>" :
-                                    "发现<b>底层身份提供商 (Layer 2+)</b> 授权端点可能缺乏重定向校验。<br><br>";
+                            List<IHttpRequestResponse> evidenceMessages = new ArrayList<>();
+                            evidenceMessages.add(callbacks.applyMarkers(checkRequestResponse, requestHighlights, null));
+                            if (redirectResult.messages.size() > 1) {
+                                evidenceMessages.addAll(redirectResult.messages.subList(1, redirectResult.messages.size()));
+                            }
+
+                            String issueTitle = isWeakF7Payload ?
+                                    "[Weak Flaw 7] Layer 1 Weak Redirect URI Validation" :
+                                    "[Flaw 7] Layer 1 Open Redirect";
+                            String severity = isWeakF7Payload ? "Medium" : "High";
+                            String confidence = isWeakF7Payload ? "Tentative" : "Firm";
+                            String classificationDesc = isWeakF7Payload ?
+                                    "<b>Classification:</b> Weak F7. The accepted payload indicates unsafe redirect_uri handling, but may not be directly exploitable in every deployment.<br><br>" :
+                                    "<b>Classification:</b> F7. The direct <code>https://attacker.com</code> redirect_uri payload was accepted.<br><br>";
+                            String issueDesc = "发现<b>第一层网关 (MCP Server)</b> 授权端点可能缺乏重定向校验。<br><br>";
                             issues.add(new CustomScanIssue(
                                     baseRequestResponse.getHttpService(),
                                     helpers.analyzeRequest(baseRequestResponse).getUrl(),
-                                    new IHttpRequestResponse[] { callbacks.applyMarkers(checkRequestResponse, requestHighlights, null) },
+                                    evidenceMessages.toArray(new IHttpRequestResponse[0]),
                                     issueTitle,
-                                    issueDesc + "我们在请求中注入了恶意/畸形的 redirect_uri Payload: <br><code>" + payload_redir + "</code><br><br>"
+                                    issueDesc + classificationDesc + "我们在请求中注入了恶意/畸形的 redirect_uri Payload: <br><code>" + payload_redir + "</code><br><br>"
+                                            + describeRedirectFollowResult(redirectResult)
                                             + "<b>行为特征判定：</b><br>"
-                                            + "服务器<b>没有返回 4xx 错误状态码，也没有在响应正文中提示 invalid/mismatch 等错误字样</b>。这表明系统可能接受了该非法输入，并继续推进了内部状态机。<br><br>"
+                                            + "服务器<b>连续跳转后的最终响应为 200，且页面正文不包含 error/invalid/mismatch/unauthorized/bad request 等错误关键词</b>。这表明系统可能接受了该非法输入，并继续推进了内部状态机。<br><br>"
                                             + "在 MCP 等嵌套架构中，这极易导致恶意载荷被无条件打包并传递，最终引发延迟的 Open Redirect 攻击。",
-                                    "High",
-                                    "Tentative"));
+                                    severity,
+                                    confidence));
                             break; // 找到漏洞跳出循环
                         }
                     }
@@ -3931,9 +4079,9 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                         String injected_scope = payload_scope;
                         if (scopeParameter != null) {
                             // OAuth 标准中 Scope 多值以空格分隔
-                            injected_scope = scopeParameter.getValue() + " " + payload_scope;
+                            injected_scope = scopeParameter.getValue() + "+" + payload_scope;
                         } else if (isOpenID) {
-                            injected_scope = "openid " + payload_scope;
+                            injected_scope = "openid+" + payload_scope;
                         }
 
                         // =========================================================================
