@@ -5254,6 +5254,36 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
         return null;
     }
 
+    private boolean hasRedirectLikeJsonStringField(String jsonText) {
+        if (jsonText == null) {
+            return false;
+        }
+        Pattern redirectLikeFieldPattern = Pattern.compile(
+                "(?i)\"[^\"]*(?:redirect|callback|return|uri|url)[^\"]*\"\\s*:\\s*\""
+        );
+        return redirectLikeFieldPattern.matcher(jsonText).find();
+    }
+
+    private String replaceRedirectLikeJsonStringValues(String jsonText, String replacementValue) {
+        if (jsonText == null || replacementValue == null) {
+            return jsonText;
+        }
+
+        Pattern redirectLikeFieldPattern = Pattern.compile(
+                "(?i)(\"[^\"]*(?:redirect|callback|return|uri|url)[^\"]*\"\\s*:\\s*\")((?:\\\\.|[^\"\\\\])*)(\")"
+        );
+        Matcher matcher = redirectLikeFieldPattern.matcher(jsonText);
+        StringBuffer rewritten = new StringBuffer();
+        while (matcher.find()) {
+            matcher.appendReplacement(
+                    rewritten,
+                    Matcher.quoteReplacement(matcher.group(1) + replacementValue + matcher.group(3))
+            );
+        }
+        matcher.appendTail(rewritten);
+        return rewritten.toString();
+    }
+
 
     /**
      * MCP 专属主动扫描模块 (增强版，包含二轮验证与智能拼接重构)
@@ -5331,7 +5361,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                     String decodedState = extracted[1];
                     String lowerDecoded = decodedState.toLowerCase();
 
-                    if (lowerDecoded.contains("redirect_uri") || lowerDecoded.contains("redirecturi") || lowerDecoded.contains("code_challenge_method")|| lowerDecoded.contains("codechallengemethod")) {
+                    if (hasRedirectLikeJsonStringField(decodedState) || lowerDecoded.contains("code_challenge_method")|| lowerDecoded.contains("codechallengemethod")) {
                         IParameter codeParam0 = helpers.getRequestParameter(baseRequestResponse.getRequest(), "code");//要判断这是不是callabck请求，要排除，不然会误判
                         if(codeParam0 == null){
                             stdout.println("[+] MCP Active Scan: Testing Flaw 4 via OAST on Layer 2+");
@@ -5344,9 +5374,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                             // ==========================================
                             // 方案 1: S256 -> plain (内层与外层参数同步降级)
                             // ==========================================
-                            String tamperedState1 = decodedState
-                                    .replaceAll("(?i)(\"redirect_uri\"\\s*:\\s*\")[^\"]+(\")", "$1" + evilUri + "$2")
-                                    .replaceAll("(?i)(\"redirecturi\"\\s*:\\s*\")[^\"]+(\")", "$1" + evilUri + "$2")
+                            String tamperedState1 = replaceRedirectLikeJsonStringValues(decodedState, evilUri)
                                     .replace("S256", "plain").replace("s256", "plain");
 
                             String encodedTamperedPayload1;
@@ -5374,9 +5402,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck, IScannerInser
                             // ==========================================
                             // 方案 2: 彻底移除 PKCE 参数 (内层与外层同步移除以触发 Fallback)
                             // ==========================================
-                            String tamperedState2 = decodedState
-                                    .replaceAll("(?i)(\"redirect_uri\"\\s*:\\s*\")[^\"]+(\")", "$1" + evilUri + "$2")
-                                    .replaceAll("(?i)(\"redirecturi\"\\s*:\\s*\")[^\"]+(\")", "$1" + evilUri + "$2");
+                            String tamperedState2 = replaceRedirectLikeJsonStringValues(decodedState, evilUri);
 
                             // 移除内层 JSON 中的 code_challenge 和 code_challenge_method 键值对
                             tamperedState2 = tamperedState2.replaceAll("(?i)\"code_?challenge\"\\s*:\\s*\"[^\"]+\"\\s*,?\\s*", "");
